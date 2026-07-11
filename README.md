@@ -5,17 +5,20 @@ It was created to help identify and exploit SSRF vulnerabilities similar to thes
  * [CVE-2021-21311 Writeup](https://github.com/vrana/adminer/files/5957311/Adminer.SSRF.pdf)
  * [Gitlab SSRF redirect vulnerability](https://gitlab.com/gitlab-org/gitlab-foss/-/issues/54649)
 
+> Use RedKing only against systems you are authorized to test.
+
 ## What's New
 
 * **Rotate mode** (`-mode rotate`) — read a file of hosts and hand out a different target on each request, walking the list in order (or forever with `-loop`).
-* **Multi-location secret gate** — rotation only fires for requests carrying a shared secret, which can ride in the **User-Agent**, **any request header** (`allheaders`), a **`?rk=` query param**, the **`X-Red-King` header**, or the **URL path**. Configure the accepted locations with `-gatein`. This keeps crawlers, preview bots, and scanners from draining your host list, while still working through a server-side fetcher that won't forward a custom header.
+* **Antibot mode** (`-mode antibot`) — gate a single real `-url` behind the same secret the rotate gate uses, but instead of *dropping* requests that fail the gate, redirect them to a harmless **`-decoy`** URL (default: a rickroll). Secret-carrying requests get the real `-url`; bots, scanners, and skids get the decoy, so a passing crawler just sees a boring open-redirect and nothing about the real target is revealed.
+* **Multi-location secret gate** — the gate (shared by rotate and antibot) only fires for requests carrying a shared secret, which can ride in the **User-Agent**, **any request header** (`allheaders`), a **`?rk=` query param**, the **`X-Red-King` header**, or the **URL path**. Configure the accepted locations with `-gatein`. This keeps crawlers, preview bots, and scanners from draining your host list, while still working through a server-side fetcher that won't forward a custom header.
 * **Auto-generated secret** — if you don't pass `-secret`, RedKing generates a `crypto/rand` token at startup and prints ready-to-use examples for each enabled location.
 * **Secret stripping** — wherever the secret is found, it's removed from the request before RedKing logs or acts on it (the User-Agent is tidied back to its real value).
-* **`-debug` request dump** — on an ignored request, print the full request line, the expected secret, and every header so you can see exactly what the fetcher sent and where (if anywhere) your secret arrived.
+* **`-debug` request dump** — on an ignored (rotate) or decoyed (antibot) request, print the full request line, the expected secret, and every header so you can see exactly what the fetcher sent and where (if anywhere) your secret arrived.
 * **`-loop` with wrap-around logging** — cycle through the list forever and see each wrap (pass number, position, running total) in verbose (`-v`) output.
-* **`-nogate`** — disable the gate entirely and rotate for every request.
+* **`-nogate`** — disable the gate entirely and treat every request as authorized.
 
-> **⚠️ Heads up: some fetchers strip your secret.** Many server-side fetchers (e.g. link-preview / URL-extraction backends) send their *own* `User-Agent` and headers when they fetch your URL, and forward **only the path and query** of the URL you injected — so `header`, `ua`, and even `allheaders` may never see your secret. If rotation isn't firing, run RedKing with **`-debug`** and read the dumped headers on the ignored request: it shows the exact `User-Agent`, every header, and the secret RedKing is expecting, so you can tell whether your secret arrived and in what field. If it's not in any header, use the **`query`** (`?rk=<secret>`) or **`path`** (`/<secret>/...`) channel instead — those ride inside the URL and survive the fetch.
+> **⚠️ Heads up: some fetchers strip your secret.** Many server-side fetchers (e.g. link-preview / URL-extraction backends) send their *own* `User-Agent` and headers when they fetch your URL, and forward **only the path and query** of the URL you injected — so `header`, `ua`, and even `allheaders` may never see your secret. If the gate isn't firing, run RedKing with **`-debug`** and read the dumped headers on the ignored/decoyed request: it shows the exact `User-Agent`, every header, and the secret RedKing is expecting, so you can tell whether your secret arrived and in what field. If it's not in any header, use the **`query`** (`?rk=<secret>`) or **`path`** (`/<secret>/...`) channel instead — those ride inside the URL and survive the fetch.
 
 ## How to Use it
 Run RedKing with the `-h` flag to see available options and formats.
@@ -24,11 +27,13 @@ Run RedKing with the `-h` flag to see available options and formats.
 ./RedKing -h
 Usage of ./RedKing:
   -debug
-    	Debug: on an ignored rotate request, dump the full request line, expected secret, and all headers so you can see where (if anywhere) the secret arrived
+    	Debug: on an ignored/decoyed gated request, dump the full request line, expected secret, and all headers so you can see where (if anywhere) the secret arrived
+  -decoy string
+    	Where to send requests that fail the gate (bots/scanners/skids). Defaults to a rickroll; set this to send them to any other endpoint (antibot mode) (default "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
   -gatein string
-    	Comma-separated list of locations to accept the secret from, tried in order. Valid: ua, allheaders, query, header, path (rotate mode) (default "ua,query,header,path")
+    	Comma-separated list of locations to accept the secret from, tried in order. Valid: ua, allheaders, query, header, path (rotate/antibot modes) (default "ua,query,header,path")
   -header string
-    	Header name checked for the secret. HTTP header names are case-insensitive; the canonical form (e.g. X-Red-King) avoids proxies like Burp rewriting the casing (rotate mode) (default "X-Red-King")
+    	Header name checked for the secret. HTTP header names are case-insensitive; the canonical form (e.g. X-Red-King) avoids proxies like Burp rewriting the casing (rotate/antibot modes) (default "X-Red-King")
   -hostfile string
     	Path to a file of hostnames/URLs to rotate through, one per line (rotate mode)
   -loop
@@ -40,21 +45,24 @@ Usage of ./RedKing:
     		Each number will redirect to a different port on the target host.
     		The built in port scan ports are: 22,80,443,445,3389,8000,8080
     	rotate - read -hostfile and redirect each request to the next host in the
-    		list. Gate with -secret so only requests carrying the secret rotate
-    		(keeps bots from consuming the list). Add -loop to cycle forever.
+    		list. Gate with -header/-secret so only requests carrying the secret header
+    		rotate (keeps bots from consuming the list). Add -loop to cycle forever.
+    	antibot - gate a single -url like rotate does, but send requests that fail
+    		the gate to a harmless -decoy URL (default: a rickroll) instead of dropping
+    		them. Secret-carrying requests get -url; bots/scanners/skids get -decoy.
     	 (default "single")
   -nogate
-    	Disable the header gate and rotate for every request (rotate mode)
+    	Disable the gate and treat every request as authorized (rotate/antibot modes)
   -p int
     	The port used to host the redirect server (default 8080)
   -param string
-    	Query parameter name checked for the secret, e.g. ?rk=<secret> (rotate mode) (default "rk")
+    	Query parameter name checked for the secret, e.g. ?rk=<secret> (rotate/antibot modes) (default "rk")
   -r int
     	Redirect status code - suggested 301, 302, or 307 (default 302)
   -secret string
-    	Secret value that opens the gate. If empty, a secure random secret is generated and printed at startup (rotate mode)
+    	Secret value that opens the gate. If empty, a secure random secret is generated and printed at startup (rotate/antibot modes)
   -url string
-    	The URL used for redirects (single/portscan modes)
+    	The URL used for redirects (single/portscan/antibot modes; in antibot this is the REAL target)
   -v	Verbose
 ```
 
@@ -322,6 +330,92 @@ first host:
 
 **Note:** the secret rides in plaintext (whichever location you use) and, over plain HTTP, is replayable by anyone who can observe the traffic. Use a fresh
 secret per engagement, and run RedKing behind TLS (or a TLS-terminating proxy) where it matters.
+
+### Antibot Mode
+
+Antibot mode redirects a **single** real target (`-url`) but puts it behind the exact same secret gate that rotate mode uses. The difference is what happens to
+requests that *don't* carry the secret: instead of being dropped with a `404`, they get a normal-looking redirect to a harmless **decoy** (`-decoy`). So the two
+outcomes are:
+
+* **Gate passes** (request carries the secret) → redirect to `-url`, the real target.
+* **Gate fails** (bots, scanners, skids, random traffic) → redirect to `-decoy`, which defaults to a rickroll (`https://www.youtube.com/watch?v=dQw4w9WgXcQ`).
+
+Because a failing request gets a clean `302` to a benign, unrelated URL rather than a `404` or `503`, anything scanning your RedKing URL just sees a boring
+open-redirect — nothing about the real target is exposed.
+
+The secret, its locations (`-gatein`), the header/param names (`-header`/`-param`), auto-generation, secret-stripping, and `-debug` all behave exactly as they
+do in rotate mode; see the [rotate gate section](#the-gate--and-why-it-lives-in-several-places) for the full explanation of *why* the secret can ride in the UA,
+query, path, or headers. Antibot mode differs from rotate only in that it serves one fixed real URL (there is no host list) and never returns `404`/`503` — every
+request receives a redirect, either to `-url` or to `-decoy`.
+
+`-decoy` is the optional "send bots somewhere else" override: point it at any endpoint you like (a honeypot, a canary, a logging collector, or leave it as the
+default rickroll). With `-nogate`, the gate always passes, so every request receives `-url` and the decoy is never used.
+
+**Flags** (antibot mode) \
+`-url` — the **real** target that secret-carrying requests are redirected to (required) \
+`-decoy` — where everything failing the gate is sent (default: rickroll) \
+`-secret` — secret that opens the gate; auto-generated if empty \
+`-gatein` — locations to accept the secret from, in order (valid: `ua, allheaders, query, header, path`; default `ua,query,header,path`) \
+`-header` — header name to check (default `X-Red-King`) \
+`-param` — query parameter name to check (default `rk`) \
+`-nogate` — disable the gate; every request gets `-url` (decoy unused) \
+`-debug` — on a decoyed request, dump the full request line, expected secret, and all headers
+
+**RedKing Output**
+```
+./RedKing -mode antibot -url https://real-target.internal/admin -v
+
+
+______         _   _   ___
+| ___ \       | | | | / (_)
+| |_/ /___  __| | | |/ / _ _ __   __ _
+|    // _ \/ _' | |    \| | '_ \ / _' |
+| |\ \  __/ (_| | | |\  \ | | | | (_| |
+\_| \_\___|\__,_| \_| \_/_|_| |_|\__, |
+                                  __/ |
+                                 |___/
+
+
+Mode: antibot
+Real URL: https://real-target.internal/admin
+Decoy URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+Gate: secret accepted in: ua, query, header, path
+Port: :8080
+
+Secret: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
+How to supply it (any enabled location works):
+  ua     append to your app User-Agent, inside the parens:
+           "...bldTimestamp/1782446400000; 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08)"
+  query  inject a URL with the param:
+           http://<your-host>/anything?rk=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+  header direct testing only (fetchers won't forward it):
+           curl -H "X-Red-King: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" http://localhost:8080/
+  path   inject a URL whose path starts with the secret:
+           http://<your-host>/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08/anything
+
+Starting server on localhost:8080
+2026/07/11 21:07:10 REDIRECTED 72.30.14.65:55600 -> https://real-target.internal/admin  (real target, gate: query)
+2026/07/11 21:07:18 DECOY 72.30.14.20:33888 -> https://www.youtube.com/watch?v=dQw4w9WgXcQ  (no valid secret in ua/query/header/path)
+```
+
+**TestScript Output**
+```
+SECRET=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
+# Secret present -> real target:
+curl -s -o /dev/null -w "%{http_code} -> %{redirect_url}\n" "localhost:8080/anything?rk=$SECRET"
+302 -> https://real-target.internal/admin
+
+# No secret (a "bot") -> decoy:
+curl -s -o /dev/null -w "%{http_code} -> %{redirect_url}\n" localhost:8080/
+302 -> https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```
+
+Send bots to your own endpoint instead of the rickroll with `-decoy`:
+```
+./RedKing -mode antibot -url https://real-target.internal/admin -decoy https://honeypot.example.com/trap
+```
 
 ## Docker
 To run in docker, run the image and specify command line arguments.
