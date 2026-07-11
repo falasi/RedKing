@@ -5,25 +5,56 @@ It was created to help identify and exploit SSRF vulnerabilities similar to thes
  * [CVE-2021-21311 Writeup](https://github.com/vrana/adminer/files/5957311/Adminer.SSRF.pdf)
  * [Gitlab SSRF redirect vulnerability](https://gitlab.com/gitlab-org/gitlab-foss/-/issues/54649)
 
+## What's New
+
+* **Rotate mode** (`-mode rotate`) — read a file of hosts and hand out a different target on each request, walking the list in order (or forever with `-loop`).
+* **Multi-location secret gate** — rotation only fires for requests carrying a shared secret, which can ride in the **User-Agent**, **any request header** (`allheaders`), a **`?rk=` query param**, the **`X-Red-King` header**, or the **URL path**. Configure the accepted locations with `-gatein`. This keeps crawlers, preview bots, and scanners from draining your host list, while still working through a server-side fetcher that won't forward a custom header.
+* **Auto-generated secret** — if you don't pass `-secret`, RedKing generates a `crypto/rand` token at startup and prints ready-to-use examples for each enabled location.
+* **Secret stripping** — wherever the secret is found, it's removed from the request before RedKing logs or acts on it (the User-Agent is tidied back to its real value).
+* **`-debug` request dump** — on an ignored request, print the full request line, the expected secret, and every header so you can see exactly what the fetcher sent and where (if anywhere) your secret arrived.
+* **`-loop` with wrap-around logging** — cycle through the list forever and see each wrap (pass number, position, running total) in verbose (`-v`) output.
+* **`-nogate`** — disable the gate entirely and rotate for every request.
+
+> **⚠️ Heads up: some fetchers strip your secret.** Many server-side fetchers (e.g. link-preview / URL-extraction backends) send their *own* `User-Agent` and headers when they fetch your URL, and forward **only the path and query** of the URL you injected — so `header`, `ua`, and even `allheaders` may never see your secret. If rotation isn't firing, run RedKing with **`-debug`** and read the dumped headers on the ignored request: it shows the exact `User-Agent`, every header, and the secret RedKing is expecting, so you can tell whether your secret arrived and in what field. If it's not in any header, use the **`query`** (`?rk=<secret>`) or **`path`** (`/<secret>/...`) channel instead — those ride inside the URL and survive the fetch.
+
 ## How to Use it
 Run RedKing with the `-h` flag to see available options and formats.
 
 ```
 ./RedKing -h
 Usage of ./RedKing:
+  -debug
+    	Debug: on an ignored rotate request, dump the full request line, expected secret, and all headers so you can see where (if anywhere) the secret arrived
+  -gatein string
+    	Comma-separated list of locations to accept the secret from, tried in order. Valid: ua, allheaders, query, header, path (rotate mode) (default "ua,query,header,path")
+  -header string
+    	Header name checked for the secret. HTTP header names are case-insensitive; the canonical form (e.g. X-Red-King) avoids proxies like Burp rewriting the casing (rotate mode) (default "X-Red-King")
+  -hostfile string
+    	Path to a file of hostnames/URLs to rotate through, one per line (rotate mode)
+  -loop
+    	Cycle back to the start of the list when hosts are exhausted instead of stopping (rotate mode)
   -mode string
     	The mode RedKing should execute in. Select from:
     	single - redirect to a single URL
     	portscan - create a series of redirects at localhost/1,localhost/2,...
     		Each number will redirect to a different port on the target host.
-    	The built in port scan ports are: 22,80,443,445,3389,8000,8080
+    		The built in port scan ports are: 22,80,443,445,3389,8000,8080
+    	rotate - read -hostfile and redirect each request to the next host in the
+    		list. Gate with -secret so only requests carrying the secret rotate
+    		(keeps bots from consuming the list). Add -loop to cycle forever.
     	 (default "single")
+  -nogate
+    	Disable the header gate and rotate for every request (rotate mode)
   -p int
     	The port used to host the redirect server (default 8080)
+  -param string
+    	Query parameter name checked for the secret, e.g. ?rk=<secret> (rotate mode) (default "rk")
   -r int
     	Redirect status code - suggested 301, 302, or 307 (default 302)
+  -secret string
+    	Secret value that opens the gate. If empty, a secure random secret is generated and printed at startup (rotate mode)
   -url string
-    	The URL used for redirects
+    	The URL used for redirects (single/portscan modes)
   -v	Verbose
 ```
 
@@ -139,11 +170,164 @@ curl: (28) Connection timed out after 1000 milliseconds
 
 Notice that for endpoints 0,3,4,5,and 6 the connection timed out. This indicates that there is likely _not_ a service running on those ports.
 
+### Rotate Mode
+
+Rotate mode reads a file of hostnames/URLs and hands out a different one on each request. The first request is redirected to the first host, the next request
+gets the second host, and so on until the list is exhausted (or forever, with `-loop`). This is useful when a single SSRF trigger point should walk through a
+series of targets without editing the config between requests.
+
+#### The gate — and why it lives in several places
+
+To keep crawlers, link-preview bots, and scanners from silently consuming your host list, rotation is gated behind a shared secret. The wrinkle in a real
+SSRF: the server that fetches your RedKing URL (a link-preview or extraction backend, say) makes its **own** outbound request and will **not** forward a custom
+request header you set on your request to *it*. A header-only gate would therefore reject the very requests you want to redirect.
+
+So RedKing accepts the secret from any location you enable with `-gatein` (default `ua,query,header,path`), tried in that order:
+
+| Location | How to supply it | Notes |
+| --- | --- | --- |
+| `query` | Inject a URL with `?rk=<secret>` (name set by `-param`) | **Most reliable through a fetcher** — rides inside the URL, which the fetcher preserves. |
+| `path` | Inject a URL whose first path segment is the secret: `/<secret>/anything` | Also rides in the URL, but may be normalized/rejected by some fetchers or WAFs. |
+| `ua` | Put the secret in your app `User-Agent`, e.g. `...bldTimestamp/1782446400000; <secret>)` | Works only if the fetcher forwards the caller's UA — many send their own. |
+| `allheaders` | Any request header value contains the secret | Catches fetchers that relay the secret in a non-standard header (e.g. `X-Yahoo-Rmf-User-Agent`). Substring-scans every header. |
+| `header` | Send `X-Red-King: <secret>` | Direct `curl`/Burp testing only; won't survive a fetcher. |
+
+**If rotation isn't firing, run with `-debug`.** On every ignored request RedKing will dump the request line, the secret it's *expecting*, the `User-Agent`, and
+every header it received — so you can see exactly what the fetcher sent and whether your secret arrived at all. In practice, server-side fetchers often strip the
+UA and headers and forward only the URL, so **`query` and `path` are the channels that survive**; reserve `ua`/`header` for clients you control directly.
+
+Whichever location carries the secret is **stripped** from the request before RedKing logs or acts on it — the `User-Agent` is tidied back to its real value, the
+`rk` param is dropped, the header is deleted, or the path segment is removed. (This only affects RedKing's own view; because RedKing issues a `Location` redirect
+rather than proxying, it cannot scrub the secret from what the client sends onward — so treat the secret as disposable per engagement.)
+
+If you don't provide `-secret`, RedKing generates a secure random token (`crypto/rand`, 32 bytes, hex) and prints it plus per-location examples at startup. Use
+`-nogate` to drop the gate entirely (rotate for every request), or narrow the accepted locations, e.g. `-gatein query,path` or `-gatein ua,query`.
+
+**Flags** (rotate mode) \
+`-hostfile` — file of hosts, one per line (required) \
+`-secret` — secret that opens the gate; auto-generated if empty \
+`-gatein` — locations to accept the secret from, in order (valid: `ua, allheaders, query, header, path`; default `ua,query,header,path`) \
+`-header` — header name to check (default `X-Red-King`) \
+`-param` — query parameter name to check (default `rk`) \
+`-loop` — cycle back to the top of the list instead of stopping once hosts run out \
+`-nogate` — disable the gate and rotate for every request \
+`-debug` — on an ignored request, dump the full request line, expected secret, and all headers (diagnose whether/where your secret arrived)
+
+**Hostfile format** \
+One host per line. Blank lines and lines beginning with `#` are ignored. A line without a scheme has `https://` prepended automatically, so both of the
+following are valid:
+
+```
+# targets.txt
+hostx.com
+https://hosty.com/some/path
+hostz.com
+```
+
+**RedKing Output**
+```
+./RedKing -mode rotate -hostfile targets.txt -v
+
+
+______         _   _   ___
+| ___ \       | | | | / (_)
+| |_/ /___  __| | | |/ / _ _ __   __ _
+|    // _ \/ _' | |    \| | '_ \ / _' |
+| |\ \  __/ (_| | | |\  \ | | | | (_| |
+\_| \_\___|\__,_| \_| \_/_|_| |_|\__, |
+                                  __/ |
+                                 |___/
+
+
+Mode: rotate
+Hostfile: targets.txt (3 hosts)
+Gate: secret accepted in: ua, query, header, path
+Loop: false
+Port: :8080
+
+Secret: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
+How to supply it (any enabled location works):
+  ua     append to your app User-Agent, inside the parens:
+           "...bldTimestamp/1782446400000; 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08)"
+  query  inject a URL with the param:
+           http://<your-host>/anything?rk=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+  header direct testing only (fetchers won't forward it):
+           curl -H "X-Red-King: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" http://localhost:8080/
+  path   inject a URL whose path starts with the secret:
+           http://<your-host>/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08/anything
+
+Starting server on localhost:8080
+2026/07/11 19:31:37 REDIRECTED 72.30.14.65:55600 -> https://hostx.com  (list item 1/3, pass #1, 1 served total, gate: ua)
+2026/07/11 19:31:40 REDIRECTED 72.30.14.17:39844 -> https://hosty.com/some/path  (list item 2/3, pass #1, 2 served total, gate: ua)
+2026/07/11 19:31:44 REDIRECTED 72.30.14.20:33888 -> https://hostz.com  (list item 3/3, pass #1, 3 served total, gate: ua)
+2026/07/11 19:31:48 Host list exhausted after 3 redirect(s) - request from 72.30.14.64:58540 not redirected
+```
+
+A request that carries no valid secret in any enabled location is ignored (`404`) and never advances the list:
+
+```
+2026/07/11 19:31:25 Ignored request from 72.30.14.20:33888 (no valid secret in ua/query/header/path)
+```
+
+Add **`-debug`** to see *why* it was ignored — the full request as RedKing received it, including the secret it expected and every header, so you can tell whether
+your secret arrived and in which field:
+
+```
+2026/07/11 20:01:23 Ignored request from 72.30.14.17:34238 (no valid secret in ua/query/header/path)
+2026/07/11 20:01:23   GET /bananas
+2026/07/11 20:01:23   expecting secret: baf1edc1b696cdf1d51ebe289190dd664bb7f67d2c65b52b6525dcc87b8e6868
+2026/07/11 20:01:23   User-Agent: "Mozilla/5.0 (compatible; Yahoo Link Preview; https://help.yahoo.com/kb/mail/yahoo-link-preview-SLN23615.html)"
+2026/07/11 20:01:23   header Accept: */*
+2026/07/11 20:01:23   header Accept-Encoding: gzip
+2026/07/11 20:01:23   header User-Agent: Mozilla/5.0 (compatible; Yahoo Link Preview; ...)
+```
+
+Here the fetcher sent its **own** User-Agent and no secret anywhere in the request — so `ua`/`header` can't work, and the fix is to inject the secret via
+`query` (`?rk=<secret>`) or `path`, which the fetcher preserves.
+
+**TestScript Output**
+```
+# Grab the secret RedKing printed at startup:
+SECRET=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
+# Header channel (direct testing):
+for i in {1..4}; do curl -s -o /dev/null -w "%{http_code} -> %{redirect_url}\n" -H "X-Red-King: $SECRET" localhost:8080/; done
+302 -> https://hostx.com
+302 -> https://hosty.com/some/path
+302 -> https://hostz.com
+503 ->
+
+# Query channel (useful for GET SSRF) - same secret, no header needed:
+curl -s -o /dev/null -w "%{http_code} -> %{redirect_url}\n" "localhost:8080/anything?rk=$SECRET"
+
+# No secret anywhere -> ignored, list untouched:
+curl -s -o /dev/null -w "%{http_code}\n" localhost:8080/
+404
+```
+
+Once the list is exhausted, further requests return `503`. (The server keeps state, so the runs above assume a freshly started RedKing — or use `-loop`.)
+
+**Loop mode** \
+Add `-loop` to cycle through the list forever instead of stopping. In verbose (`-v`) mode each wrap-around is logged so you can see when it returns to the
+first host:
+
+```
+2026/07/11 19:31:04 REDIRECTED 72.30.14.65:55600 -> https://hostx.com  (list item 1/3, pass #1, 1 served total, gate: ua)
+2026/07/11 19:31:06 REDIRECTED 72.30.14.17:39844 -> https://hosty.com/some/path  (list item 2/3, pass #1, 2 served total, gate: ua)
+2026/07/11 19:31:09 REDIRECTED 72.30.14.20:33888 -> https://hostz.com  (list item 3/3, pass #1, 3 served total, gate: ua)
+2026/07/11 19:31:12 Rotated back to the first host - starting pass #2 over 3 host(s) (3 redirect(s) served so far)
+2026/07/11 19:31:12 REDIRECTED 72.30.14.64:58540 -> https://hostx.com  (list item 1/3, pass #2, 4 served total, gate: ua)
+```
+
+**Note:** the secret rides in plaintext (whichever location you use) and, over plain HTTP, is replayable by anyone who can observe the traffic. Use a fresh
+secret per engagement, and run RedKing behind TLS (or a TLS-terminating proxy) where it matters.
+
 ## Docker
 To run in docker, run the image and specify command line arguments.
 ```
 docker pull bpsizemore/redking
 docker run bpsizemore/redking -h
-docker run bpsizemore/redking -url test.com -mode simple 
+docker run bpsizemore/redking -url test.com -mode single
 ```
 **https://hub.docker.com/r/bpsizemore/redking**
