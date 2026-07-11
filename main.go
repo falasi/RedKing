@@ -407,7 +407,7 @@ ______         _   _   ___
                                   __/ |
                                  |___/
 
-              Modified by Falasi - credits to bpsizemore
+              Modified by Falasi - credits to bpsizemore , Rick ROll'D Edition
 `
 	redirectStatusPtr := flag.Int("r", 302, "Redirect status code - suggested 301, 302, or 307")
 	verbosityPtr := flag.Bool("v", false, "Verbose")
