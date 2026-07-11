@@ -321,7 +321,16 @@ func main() {
 	Config.validModes = []string{"single", "portscan", "rotate"}
 	Config.asciiart =
 		`
-Paranoids
+______         _   _   ___
+| ___ \       | | | | / (_)
+| |_/ /___  __| | | |/ / _ _ __   __ _
+|    // _ \/ _' | |    \| | '_ \ / _' |
+| |\ \  __/ (_| | | |\  \ | | | | (_| |
+\_| \_\___|\__,_| \_| \_/_|_| |_|\__, |
+                                  __/ |
+                                 |___/
+
+              Modified by Falasi - credits to bpsizemore
 `
 	redirectStatusPtr := flag.Int("r", 302, "Redirect status code - suggested 301, 302, or 307")
 	verbosityPtr := flag.Bool("v", false, "Verbose")
