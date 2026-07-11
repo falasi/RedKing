@@ -22,6 +22,7 @@ var Config struct {
 	debug          bool
 	redirectUrl    string
 	redirectHost   string
+	decoyUrl       string // antibot mode: bogus target handed to bots / non-secret requests
 	port           int
 	httpPort       string
 	mode           string
@@ -80,6 +81,28 @@ func GenerateSecret() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// establishSecret resolves the shared secret for gated modes. If the gate is
+// disabled (-nogate) it is a no-op. Otherwise it uses the user-supplied secret,
+// or generates a secure random one and flags it so main() prints it at startup.
+// rotate mode keeps its own inline logic; this exists so new gated modes (antibot)
+// can reuse the same behaviour without touching the original.
+func establishSecret(secretFlag string) error {
+	if Config.rotateOpen {
+		return nil
+	}
+	if secretFlag != "" {
+		Config.rotateSecret = secretFlag
+		return nil
+	}
+	secret, err := GenerateSecret()
+	if err != nil {
+		return err
+	}
+	Config.rotateSecret = secret
+	Config.rotateGenerated = true
+	return nil
 }
 
 // LoadHosts reads a file of hostnames/URLs (one per line) and normalizes them.
@@ -238,6 +261,20 @@ func stripSecret(r *http.Request, via string) {
 	}
 }
 
+// dumpRequest logs the full request line, the expected secret, and every header
+// so you can see exactly what a fetcher sent and where (if anywhere) the secret
+// landed. Shared by the gated modes' debug paths.
+func dumpRequest(r *http.Request) {
+	log.Printf("  %s %s", r.Method, r.URL.RequestURI())
+	log.Printf("  expecting secret: %s", Config.rotateSecret)
+	log.Printf("  User-Agent: %q", r.Header.Get("User-Agent"))
+	for name, vals := range r.Header {
+		for _, v := range vals {
+			log.Printf("  header %s: %s", name, v)
+		}
+	}
+}
+
 // RedirectRotate hands out one host from the list per request. It walks the
 // list in order; with -loop it wraps back to the first host (logging the wrap
 // in verbose mode), otherwise it returns 503 once the list is exhausted.
@@ -315,10 +352,50 @@ func RedirectRotate() {
 	})
 }
 
+// RedirectAntibot serves two fixed targets from a single handler, chosen by the
+// same secret gate that rotate uses:
+//
+//	gate passes -> -url    (the real target; secret-carrying request)
+//	gate fails  -> -decoy  (a bogus redirect for bots / scanners)
+//
+// Unlike rotate mode, a failing request is NOT dropped with a 404 - it gets a
+// normal-looking redirect to the decoy, so a passing scanner just sees a boring
+// open-redirect and nothing about the real target is revealed. The secret can
+// be supplied in any location -gatein allows (see gateResult). With -nogate the
+// gate always passes, so every request receives -url and the decoy is unused.
+func RedirectAntibot() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		allowed, via := gateResult(r)
+		if !allowed {
+			// No secret: hand out the bogus target instead of the real one.
+			http.Redirect(w, r, Config.decoyUrl, Config.redirectStatus)
+			if Config.verbosity > 0 || Config.debug {
+				log.Printf("DECOY %s -> %s  (no valid secret in %s)",
+					r.RemoteAddr, Config.decoyUrl, strings.Join(Config.rotateGateIn, "/"))
+			}
+			if Config.debug {
+				dumpRequest(r)
+			}
+			return
+		}
+
+		// Strip the secret from RedKing's own view before logging the hit.
+		stripSecret(r, via)
+
+		http.Redirect(w, r, Config.redirectUrl, Config.redirectStatus)
+
+		if Config.verbosity > 0 {
+			log.Printf("REDIRECTED %s -> %s  (real target, gate: %s)", r.RemoteAddr, Config.redirectUrl, via)
+		} else {
+			log.Printf("REDIRECTED %s -> %s  (real target)", r.RemoteAddr, Config.redirectUrl)
+		}
+	})
+}
+
 func main() {
 	// Setup default config - not sure where this should go instead
 	Config.scanPorts = []string{"22", "80", "443", "445", "3389", "8000", "8080"}
-	Config.validModes = []string{"single", "portscan", "rotate"}
+	Config.validModes = []string{"single", "portscan", "rotate", "antibot"}
 	Config.asciiart =
 		`
 ______         _   _   ___
@@ -334,17 +411,18 @@ ______         _   _   ___
 `
 	redirectStatusPtr := flag.Int("r", 302, "Redirect status code - suggested 301, 302, or 307")
 	verbosityPtr := flag.Bool("v", false, "Verbose")
-	debugPtr := flag.Bool("debug", false, "Debug: on an ignored rotate request, dump the full request line, expected secret, and all headers so you can see where (if anywhere) the secret arrived")
-	urlPtr := flag.String("url", "", "The URL used for redirects (single/portscan modes)")
+	debugPtr := flag.Bool("debug", false, "Debug: on an ignored/decoyed gated request, dump the full request line, expected secret, and all headers so you can see where (if anywhere) the secret arrived")
+	urlPtr := flag.String("url", "", "The URL used for redirects (single/portscan/antibot modes; in antibot this is the REAL target)")
+	decoyPtr := flag.String("decoy", "https://www.youtube.com/watch?v=-8dxzT5A1-s", "Where to send requests that fail the gate (bots/scanners/skids). Defaults to a rickroll; set this to send them to any other endpoint (antibot mode)")
 	portPtr := flag.Int("p", 8080, "The port used to host the redirect server")
 	hostFilePtr := flag.String("hostfile", "", "Path to a file of hostnames/URLs to rotate through, one per line (rotate mode)")
-	rotateHeaderPtr := flag.String("header", "X-Red-King", "Header name checked for the secret. HTTP header names are case-insensitive; the canonical form (e.g. X-Red-King) avoids proxies like Burp rewriting the casing (rotate mode)")
-	rotateParamPtr := flag.String("param", "rk", "Query parameter name checked for the secret, e.g. ?rk=<secret> (rotate mode)")
-	rotateGateInPtr := flag.String("gatein", "ua,query,header,path", "Comma-separated list of locations to accept the secret from, tried in order. Valid: ua, allheaders, query, header, path (rotate mode)")
-	rotateSecretPtr := flag.String("secret", "", "Secret value that opens the gate. If empty, a secure random secret is generated and printed at startup (rotate mode)")
+	rotateHeaderPtr := flag.String("header", "X-Red-King", "Header name checked for the secret. HTTP header names are case-insensitive; the canonical form (e.g. X-Red-King) avoids proxies like Burp rewriting the casing (rotate/antibot modes)")
+	rotateParamPtr := flag.String("param", "rk", "Query parameter name checked for the secret, e.g. ?rk=<secret> (rotate/antibot modes)")
+	rotateGateInPtr := flag.String("gatein", "ua,query,header,path", "Comma-separated list of locations to accept the secret from, tried in order. Valid: ua, allheaders, query, header, path (rotate/antibot modes)")
+	rotateSecretPtr := flag.String("secret", "", "Secret value that opens the gate. If empty, a secure random secret is generated and printed at startup (rotate/antibot modes)")
 	rotateLoopPtr := flag.Bool("loop", false, "Cycle back to the start of the list when hosts are exhausted instead of stopping (rotate mode)")
-	rotateNoGatePtr := flag.Bool("nogate", false, "Disable the header gate and rotate for every request (rotate mode)")
-	modePtr := flag.String("mode", "single", "The mode RedKing should execute in. Select from:\nsingle - redirect to a single URL\nportscan - create a series of redirects at localhost/1,localhost/2,...\n\tEach number will redirect to a different port on the target host.\n\tThe built in port scan ports are: 22,80,443,445,3389,8000,8080\nrotate - read -hostfile and redirect each request to the next host in the\n\tlist. Gate with -header/-secret so only requests carrying the secret header\n\trotate (keeps bots from consuming the list). Add -loop to cycle forever.\n")
+	rotateNoGatePtr := flag.Bool("nogate", false, "Disable the gate and treat every request as authorized (rotate/antibot modes)")
+	modePtr := flag.String("mode", "single", "The mode RedKing should execute in. Select from:\nsingle - redirect to a single URL\nportscan - create a series of redirects at localhost/1,localhost/2,...\n\tEach number will redirect to a different port on the target host.\n\tThe built in port scan ports are: 22,80,443,445,3389,8000,8080\nrotate - read -hostfile and redirect each request to the next host in the\n\tlist. Gate with -header/-secret so only requests carrying the secret header\n\trotate (keeps bots from consuming the list). Add -loop to cycle forever.\nantibot - gate a single -url like rotate does, but send requests that fail\n\tthe gate to a harmless -decoy URL (default: a rickroll) instead of dropping\n\tthem. Secret-carrying requests get -url; bots/scanners/skids get -decoy.\n")
 	flag.Parse()
 
 	// Validate mode first so we know which other flags are required.
@@ -418,6 +496,24 @@ ______         _   _   ___
 				Config.rotateGenerated = true
 			}
 		}
+	case "antibot":
+		// Real target.
+		if err := ValidateUrl(urlPtr); err != nil {
+			log.Fatal(err)
+		}
+		Config.redirectUrl = *urlPtr
+		Config.redirectHost = ExtractHostFromUrl(urlPtr)
+
+		// Bogus target for anything failing the gate.
+		if err := ValidateUrl(decoyPtr); err != nil {
+			log.Fatal(fmt.Errorf("invalid -decoy URL: %w", err))
+		}
+		Config.decoyUrl = *decoyPtr
+
+		// Same secret handling as rotate, via the shared helper.
+		if err := establishSecret(*rotateSecretPtr); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	fmt.Println(Config.asciiart)
@@ -449,6 +545,32 @@ ______         _   _   ___
 			}
 		}
 		fmt.Println()
+	case "antibot":
+		var gate string
+		switch {
+		case Config.rotateOpen:
+			gate = "none (-nogate: every request gets the real URL)"
+		default:
+			gate = fmt.Sprintf("secret accepted in: %s", strings.Join(Config.rotateGateIn, ", "))
+		}
+		fmt.Printf("Mode: %s\nReal URL: %s\nDecoy URL: %s\nGate: %s\nPort: %s\n",
+			Config.mode, Config.redirectUrl, Config.decoyUrl, gate, Config.httpPort)
+		if !Config.rotateOpen {
+			fmt.Printf("\nSecret: %s\n\nHow to supply it (any enabled location works):\n", Config.rotateSecret)
+			for _, loc := range Config.rotateGateIn {
+				switch loc {
+				case "ua":
+					fmt.Printf("  ua     append to your app User-Agent, inside the parens:\n           \"...bldTimestamp/1782446400000; %s)\"\n", Config.rotateSecret)
+				case "query":
+					fmt.Printf("  query  inject a URL with the param:\n           http://<your-host>/anything?%s=%s\n", Config.rotateParam, Config.rotateSecret)
+				case "header":
+					fmt.Printf("  header direct testing only (fetchers won't forward it):\n           curl -H \"%s: %s\" http://localhost%s/\n", Config.rotateHeader, Config.rotateSecret, Config.httpPort)
+				case "path":
+					fmt.Printf("  path   inject a URL whose path starts with the secret:\n           http://<your-host>/%s/anything\n", Config.rotateSecret)
+				}
+			}
+		}
+		fmt.Println()
 	default:
 		fmt.Printf("Mode: %s \nURL: %s\nPort: %s\n\n", Config.mode, Config.redirectUrl, Config.httpPort)
 	}
@@ -460,6 +582,8 @@ ______         _   _   ___
 		RedirectPortScan(Config.redirectUrl)
 	case "rotate":
 		RedirectRotate()
+	case "antibot":
+		RedirectAntibot()
 	}
 
 	fmt.Printf("Starting server on localhost%s\n", Config.httpPort)
